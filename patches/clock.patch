@@ -1,0 +1,211 @@
+diff --git a/legacy/firmware/fsm_msg_common.h b/legacy/firmware/fsm_msg_common.h
+index eab9d7c..7bf77ad 100644
+--- a/legacy/firmware/fsm_msg_common.h
++++ b/legacy/firmware/fsm_msg_common.h
+@@ -128,6 +128,8 @@ void fsm_msgGetFeatures(const GetFeatures *msg) {
+   msg_write(MessageType_MessageType_Features, resp);
+ }
+ 
++bool layoutClockSetFromText(const char *text);
++
+ void fsm_msgPing(const Ping *msg) {
+   RESP_INIT(Success);
+ 
+@@ -142,6 +144,11 @@ void fsm_msgPing(const Ping *msg) {
+     }
+   }
+ 
++  // "SETTIME <utc_unix_seconds> [<utc_offset_seconds>]" sets the home screen clock
++  if (msg->has_message) {
++    layoutClockSetFromText(msg->message);
++  }
++
+   if (msg->has_message) {
+     resp->has_message = true;
+     memcpy(&(resp->message), &(msg->message), sizeof(resp->message));
+diff --git a/legacy/firmware/layout2.c b/legacy/firmware/layout2.c
+index 41b81a8..0217397 100644
+--- a/legacy/firmware/layout2.c
++++ b/legacy/firmware/layout2.c
+@@ -323,6 +323,140 @@ void layoutHome(void) {
+   }
+ }
+ 
++static inline int32_t clock_days_from_civil(int y, int m, int d) {
++  y -= m <= 2;
++  int era = (y >= 0 ? y : y - 399) / 400;
++  unsigned yoe = (unsigned)(y - era * 400);
++  unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
++  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++  return era * 146097 + (int32_t)doe - 719468;
++}
++
++static void clock_civil_from_days(int32_t z, int *y, unsigned *m, unsigned *d) {
++  z += 719468;
++  int era = (z >= 0 ? z : z - 146096) / 146097;
++  unsigned doe = (unsigned)(z - era * 146097);
++  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++  unsigned mp = (5 * doy + 2) / 153;
++  *d = doy - (153 * mp + 2) / 5 + 1;
++  *m = mp < 10 ? mp + 3 : mp - 9;
++  *y = (int)yoe + era * 400 + (*m <= 2);
++}
++
++// Elapsed milliseconds since boot, tolerant of the 32-bit counter wrapping
++static uint64_t clock_total_ms = 0;
++static uint32_t clock_last_ms = 0;
++
++// Time pushed from the host with "SETTIME <utc_unix_seconds> [<utc_offset_seconds>]"
++static bool clock_set_valid = false;
++static uint64_t clock_set_local_secs = 0;
++static uint64_t clock_set_at_ms = 0;
++
++static void clock_tick(void) {
++  uint32_t now_ms = timer_ms();
++  clock_total_ms += (uint32_t)(now_ms - clock_last_ms);
++  clock_last_ms = now_ms;
++}
++
++bool layoutClockSetFromText(const char *text);
++bool layoutClockSetFromText(const char *text) {
++  const char *p = text;
++  const char *prefix = "SETTIME ";
++  for (const char *q = prefix; *q; q++, p++) {
++    if (*p != *q) return false;
++  }
++  uint64_t utc = 0;
++  int digits = 0;
++  while (*p >= '0' && *p <= '9') {
++    utc = utc * 10 + (uint64_t)(*p - '0');
++    p++;
++    if (++digits > 12) return false;
++  }
++  if (digits == 0 || utc < 1700000000u) return false;  // sanity: after Nov 2023
++  int64_t offset = 0;
++  if (*p == ' ') {
++    p++;
++    bool neg = false;
++    if (*p == '-') {
++      neg = true;
++      p++;
++    } else if (*p == '+') {
++      p++;
++    }
++    int64_t v = 0;
++    int od = 0;
++    while (*p >= '0' && *p <= '9') {
++      v = v * 10 + (*p - '0');
++      p++;
++      if (++od > 6) return false;
++    }
++    if (od == 0) return false;
++    offset = neg ? -v : v;
++  }
++  clock_tick();
++  clock_set_local_secs = (uint64_t)((int64_t)utc + offset);
++  clock_set_at_ms = clock_total_ms;
++  clock_set_valid = true;
++  return true;
++}
++
++static void layoutDrawClock(void) {
++  clock_tick();
++
++  uint64_t secs;
++  if (clock_set_valid) {
++    // time sent from the host, counted forward
++    secs = clock_set_local_secs + (clock_total_ms - clock_set_at_ms) / 1000u;
++  } else {
++#if EMULATOR
++    // emulator only: use the host clock (UTC) shifted to East Africa Time (UTC+3)
++    secs = (uint64_t)time(NULL) + 3 * 3600;
++#else
++    // device: start from the build date and time
++    // __DATE__ = "Nov  7 2026", __TIME__ = "HH:MM:SS"
++    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
++    int mon = 1;
++    for (int i = 0; i < 12; i++) {
++      if (__DATE__[0] == months[i * 3] && __DATE__[1] == months[i * 3 + 1] &&
++          __DATE__[2] == months[i * 3 + 2]) {
++        mon = i + 1;
++        break;
++      }
++    }
++    int day = (__DATE__[4] == ' ' ? 0 : __DATE__[4] - '0') * 10 + (__DATE__[5] - '0');
++    int year = (__DATE__[7] - '0') * 1000 + (__DATE__[8] - '0') * 100 +
++               (__DATE__[9] - '0') * 10 + (__DATE__[10] - '0');
++    uint32_t base_s = ((__TIME__[0] - '0') * 10 + (__TIME__[1] - '0')) * 3600 +
++                      ((__TIME__[3] - '0') * 10 + (__TIME__[4] - '0')) * 60 +
++                      ((__TIME__[6] - '0') * 10 + (__TIME__[7] - '0'));
++    secs = (uint64_t)clock_days_from_civil(year, mon, day) * 86400u + base_s +
++           clock_total_ms / 1000u;
++#endif
++  }
++
++  int32_t days = (int32_t)(secs / 86400u);
++  uint32_t sod = (uint32_t)(secs % 86400u);
++
++  int y;
++  unsigned m, d;
++  clock_civil_from_days(days, &y, &m, &d);
++
++  static const char wd[] = "SunMonTueWedThuFriSat";
++  static const char mn[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
++  unsigned w = (unsigned)((days + 4) % 7);  // 1970-01-01 was a Thursday
++
++  char tbuf[9];
++  snprintf(tbuf, sizeof(tbuf), "%02u:%02u:%02u", (unsigned)(sod / 3600),
++           (unsigned)((sod / 60) % 60), (unsigned)(sod % 60));
++  char dbuf[20];
++  snprintf(dbuf, sizeof(dbuf), "%.3s %02u %.3s %04d", wd + w * 3, d,
++           mn + (m - 1) * 3, y);
++
++  oledDrawStringCenter(OLED_WIDTH / 2, 24, tbuf, FONT_STANDARD);
++  oledDrawStringCenter(OLED_WIDTH / 2, 42, dbuf, FONT_STANDARD);
++}
++
+ void layoutHomescreen(void) {
+   if (layoutLast == layoutHomescreen || layoutLast == layoutScreensaver) {
+     oledClear();
+@@ -331,6 +465,7 @@ void layoutHomescreen(void) {
+   }
+   layoutLast = layoutHomescreen;
+ 
++#if 0  // logo, label and custom homescreen disabled for the clock
+   char label[MAX_LABEL_LEN + 1] = _("Go to trezor.io/start");
+   if (config_isInitialized()) {
+     config_getLabel(label, sizeof(label));
+@@ -354,6 +489,9 @@ void layoutHomescreen(void) {
+     }
+   }
+ 
++#endif
++  layoutDrawClock();
++
+   bool no_backup = false;
+   bool unfinished_backup = false;
+   bool needs_backup = false;
+diff --git a/legacy/firmware/trezor.c b/legacy/firmware/trezor.c
+index a29c7e9..4333313 100644
+--- a/legacy/firmware/trezor.c
++++ b/legacy/firmware/trezor.c
+@@ -107,6 +107,18 @@ void check_lock_screen(void) {
+     }
+   }
+ 
++  // clock: redraw the home screen once per second
++  {
++    static uint32_t last_clock_sec = 0xFFFFFFFF;
++    if (layoutLast == layoutHomescreen) {
++      uint32_t s = timer_ms() / 1000;
++      if (s != last_clock_sec) {
++        last_clock_sec = s;
++        layoutHomescreen();
++      }
++    }
++  }
++
+   // if homescreen is shown for too long
+   if (layoutLast == layoutHomescreen) {
+     if ((timer_ms() - system_millis_lock_start) >=

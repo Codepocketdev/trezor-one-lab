@@ -1,0 +1,6 @@
+*.orig
+*.bin
+*.elf
+id_*
+*.pem
+.env
