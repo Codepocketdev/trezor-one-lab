@@ -1,0 +1,647 @@
+--- a/legacy/firmware/fsm_msg_common.h
++++ b/legacy/firmware/fsm_msg_common.h
+@@ -130,6 +130,560 @@
+ 
+ bool layoutClockSetFromText(const char *text);
+ 
++#include "zkp_bip340.h"
++
++// ---- Nostr experiment: NIP-06 key m/44'/1237'/0'/0/0, BIP340. Test seeds only. ----
++static void nostr_hex(const uint8_t *data, size_t len, char *out) {
++  static const char digits[] = "0123456789abcdef";
++  for (size_t i = 0; i < len; i++) {
++    out[2 * i] = digits[data[i] >> 4];
++    out[2 * i + 1] = digits[data[i] & 15];
++  }
++  out[2 * len] = 0;
++}
++
++// Fills out[65] with the x-only public key in hex.
++// Returns 0 on success, -1 if no key node (a failure was already reported), -2 on a bad key.
++static int nostr_pubkey_hex(char *out) {
++  static const uint32_t path[5] = {0x80000000u | 44, 0x80000000u | 1237,
++                                   0x80000000u | 0, 0, 0};
++  HDNode *node = fsm_getDerivedNode("secp256k1", path, 5, NULL);
++  if (!node) return -1;
++  uint8_t pub[32];
++  if (zkp_bip340_get_public_key(node->private_key, pub) != 0) return -2;
++  nostr_hex(pub, sizeof(pub), out);
++  return 0;
++}
++
++#include "rand.h"
++#include "sha2.h"
++
++// ---- Nostr experiment, step 2: NOSTRSIGN <created_at> <kind> <content> ----
++// Content is 1-80 printable ASCII chars so the whole note fits on the OLED:
++// what you read on the screen is exactly what gets signed.
++#define NOSTR_MAX_CONTENT 80
++
++static const char *nostr_parse_uint(const char *s, uint32_t limit,
++                                    uint32_t *out) {
++  uint64_t v = 0;
++  const char *p = s;
++  while (*p >= '0' && *p <= '9') {
++    v = v * 10 + (uint64_t)(*p - '0');
++    if (v > limit) return NULL;
++    p++;
++  }
++  if (p == s) return NULL;
++  *out = (uint32_t)v;
++  return p;
++}
++
++static size_t nostr_utoa(uint32_t v, char *out) {
++  char tmp[10];
++  size_t n = 0, k = 0;
++  do {
++    tmp[n++] = (char)('0' + (v % 10));
++    v /= 10;
++  } while (v);
++  while (n) out[k++] = tmp[--n];
++  out[k] = 0;
++  return k;
++}
++
++static HDNode *nostr_node(void) {
++  static const uint32_t nostr_path[5] = {0x80000000u | 44, 0x80000000u | 1237,
++                                         0x80000000u | 0, 0, 0};
++  return fsm_getDerivedNode("secp256k1", nostr_path, 5, NULL);
++}
++
++// Returns 0 on success (out gets "<id hex> <sig hex>", 193 chars),
++// -1 key derivation failed (failure already sent), -2 bad input,
++// -3 cancelled on the device, -4 signing error.
++static int nostr_sign_command(const char *args, char *out) {
++  uint32_t created_at = 0, kind = 0;
++  const char *p = nostr_parse_uint(args, 0xFFFFFFFFu, &created_at);
++  if (!p || *p != ' ') return -2;
++  p = nostr_parse_uint(p + 1, 65535u, &kind);
++  if (!p || *p != ' ') return -2;
++  const char *content = p + 1;
++  size_t clen = strlen(content);
++  if (clen == 0 || clen > NOSTR_MAX_CONTENT) return -2;
++  for (size_t i = 0; i < clen; i++) {
++    uint8_t c = (uint8_t)content[i];
++    if (c < 0x20 || c > 0x7e) return -2;
++  }
++
++  HDNode *node = nostr_node();
++  if (!node) return -1;
++  uint8_t pub[32];
++  if (zkp_bip340_get_public_key(node->private_key, pub) != 0) return -4;
++  char pubhex[65];
++  nostr_hex(pub, sizeof(pub), pubhex);
++
++  // NIP-01 serialization: [0,"<pubkey>",<created_at>,<kind>,[],"<content>"]
++  static char ser[320];
++  size_t n = 0;
++  memcpy(ser + n, "[0,\"", 4);
++  n += 4;
++  memcpy(ser + n, pubhex, 64);
++  n += 64;
++  memcpy(ser + n, "\",", 2);
++  n += 2;
++  n += nostr_utoa(created_at, ser + n);
++  ser[n++] = ',';
++  n += nostr_utoa(kind, ser + n);
++  memcpy(ser + n, ",[],\"", 5);
++  n += 5;
++  for (size_t i = 0; i < clen; i++) {
++    if (content[i] == '"' || content[i] == '\\') ser[n++] = '\\';
++    ser[n++] = content[i];
++  }
++  ser[n++] = '"';
++  ser[n++] = ']';
++  ser[n] = 0;
++
++  // Show the note: a title line plus the content in 4 lines of 20 chars.
++  char title[24];
++  size_t t = 11;
++  memcpy(title, "Nostr kind ", 11);
++  t += nostr_utoa(kind, title + t);
++  title[t++] = ':';
++  title[t] = 0;
++  char lines[4][21];
++  for (size_t row = 0; row < 4; row++) {
++    size_t off = row * 20;
++    size_t take = 0;
++    if (off < clen) {
++      take = clen - off;
++      if (take > 20) take = 20;
++      memcpy(lines[row], content + off, take);
++    }
++    lines[row][take] = 0;
++  }
++  layoutDialogSwipe(NULL, _("Cancel"), _("Sign"), NULL, title, lines[0],
++                    lines[1][0] ? lines[1] : NULL,
++                    lines[2][0] ? lines[2] : NULL,
++                    lines[3][0] ? lines[3] : NULL, NULL);
++  if (!protectButton(ButtonRequestType_ButtonRequest_ProtectCall, false)) {
++    return -3;
++  }
++
++  // Fetch the key again after the dialog, then sign the event id.
++  node = nostr_node();
++  if (!node) return -1;
++  uint8_t n_digest[32], n_sig[64], n_aux[32];
++  sha256_Raw((const uint8_t *)ser, n, n_digest);
++  random_buffer(n_aux, sizeof(n_aux));
++  if (zkp_bip340_sign_digest(node->private_key, n_digest, n_sig, n_aux) != 0) {
++    return -4;
++  }
++  nostr_hex(n_digest, sizeof(n_digest), out);
++  out[64] = ' ';
++  nostr_hex(n_sig, sizeof(n_sig), out + 65);
++  return 0;
++}
++
++// ---- Nostr experiment, step 4: full NIP-01 events, sent in chunks ----
++// Host: NOSTREV BEGIN <total_len>, NOSTREV ADD <offset> <text>..., NOSTREV SIGN
++// The text is the exact NIP-01 serialization that gets hashed. The device checks
++// it strictly (own pubkey, ASCII only, canonical escapes, no spaces), then shows
++// the content page by page exactly as it will be hashed, and signs on approval.
++#define NOSTR_EV_MAX 900
++#define NOSTR_CONTENT_MAX 400
++#define NOSTR_TAGS_MAX 20
++
++static char nostr_ev[NOSTR_EV_MAX + 1];
++static size_t nostr_ev_len = 0;
++static size_t nostr_ev_want = 0;
++static const char *nostr_ev_err = "";
++
++typedef struct {
++  uint32_t kind;
++  size_t tags;
++  char letters[NOSTR_TAGS_MAX + 1];
++  const char *tag_at[NOSTR_TAGS_MAX];
++  size_t tag_len[NOSTR_TAGS_MAX];
++  const char *content;
++  size_t content_len;
++} nostr_ev_info;
++
++static void nostr_ev_reset(void) {
++  memset(nostr_ev, 0, sizeof(nostr_ev));
++  nostr_ev_len = 0;
++  nostr_ev_want = 0;
++}
++
++static size_t nostr_ev_utoa(uint32_t v, char *out) {
++  char tmp[10];
++  size_t n = 0, k = 0;
++  do {
++    tmp[n++] = (char)('0' + (v % 10));
++    v /= 10;
++  } while (v);
++  while (n) out[k++] = tmp[--n];
++  out[k] = 0;
++  return k;
++}
++
++static bool nostr_p_char(const char **pp, const char *end, char c) {
++  if (*pp < end && **pp == c) {
++    (*pp)++;
++    return true;
++  }
++  return false;
++}
++
++static bool nostr_p_uint(const char **pp, const char *end, uint32_t limit,
++                         uint32_t *out) {
++  const char *p = *pp;
++  uint64_t v = 0;
++  size_t digits = 0;
++  while (p < end && *p >= '0' && *p <= '9') {
++    if (digits > 0 && v == 0) return false;  // no leading zeros
++    v = v * 10 + (uint64_t)(*p - '0');
++    if (v > limit) return false;
++    digits++;
++    p++;
++  }
++  if (digits == 0) return false;
++  *pp = p;
++  *out = (uint32_t)v;
++  return true;
++}
++
++// A JSON string with only the NIP-01 escapes and printable ASCII.
++// Returns the raw (still escaped) text between the quotes.
++static bool nostr_p_string(const char **pp, const char *end, const char **start,
++                           size_t *len) {
++  const char *p = *pp;
++  if (p >= end || *p != '"') return false;
++  p++;
++  const char *s = p;
++  while (p < end) {
++    uint8_t c = (uint8_t)*p;
++    if (c == '"') {
++      *start = s;
++      *len = (size_t)(p - s);
++      *pp = p + 1;
++      return true;
++    }
++    if (c == '\\') {
++      if (p + 1 >= end) return false;
++      char e = p[1];
++      if (e != '"' && e != '\\' && e != 'n' && e != 'r' && e != 't' &&
++          e != 'b' && e != 'f')
++        return false;
++      p += 2;
++      continue;
++    }
++    if (c < 0x20 || c > 0x7e) return false;
++    p++;
++  }
++  return false;
++}
++
++// [0,"<own pubkey>",<created_at>,<kind>,[["tag",...],...],"<content>"]
++static bool nostr_ev_parse(const char *s, size_t n, const char *pubhex,
++                           nostr_ev_info *info) {
++  const char *p = s;
++  const char *end = s + n;
++  uint32_t created = 0;
++  const char *ts = NULL;
++  size_t tl = 0;
++  memset(info, 0, sizeof(*info));
++  if (n < 70 || memcmp(p, "[0,\"", 4) != 0) {
++    nostr_ev_err = "Not a NIP-01 event";
++    return false;
++  }
++  p += 4;
++  if (memcmp(p, pubhex, 64) != 0) {
++    nostr_ev_err = "Pubkey is not this device";
++    return false;
++  }
++  p += 64;
++  if (!nostr_p_char(&p, end, '"') || !nostr_p_char(&p, end, ',')) {
++    nostr_ev_err = "Bad pubkey field";
++    return false;
++  }
++  if (!nostr_p_uint(&p, end, 0xFFFFFFFFu, &created) ||
++      !nostr_p_char(&p, end, ',')) {
++    nostr_ev_err = "Bad created_at";
++    return false;
++  }
++  if (!nostr_p_uint(&p, end, 65535u, &info->kind) ||
++      !nostr_p_char(&p, end, ',')) {
++    nostr_ev_err = "Bad kind";
++    return false;
++  }
++  if (!nostr_p_char(&p, end, '[')) {
++    nostr_ev_err = "Bad tags";
++    return false;
++  }
++  if (!nostr_p_char(&p, end, ']')) {
++    for (;;) {
++      const char *tag_begin = p;
++      if (!nostr_p_char(&p, end, '[') || !nostr_p_string(&p, end, &ts, &tl)) {
++        nostr_ev_err = "Bad tag";
++        return false;
++      }
++      if (info->tags >= NOSTR_TAGS_MAX) {
++        nostr_ev_err = "Too many tags";
++        return false;
++      }
++      info->letters[info->tags++] = (tl == 1) ? ts[0] : '*';
++      while (nostr_p_char(&p, end, ',')) {
++        if (!nostr_p_string(&p, end, &ts, &tl)) {
++          nostr_ev_err = "Bad tag value";
++          return false;
++        }
++      }
++      if (!nostr_p_char(&p, end, ']')) {
++        nostr_ev_err = "Bad tag end";
++        return false;
++      }
++      info->tag_at[info->tags - 1] = tag_begin;
++      info->tag_len[info->tags - 1] = (size_t)(p - tag_begin);
++      if (nostr_p_char(&p, end, ',')) continue;
++      if (!nostr_p_char(&p, end, ']')) {
++        nostr_ev_err = "Bad tags end";
++        return false;
++      }
++      break;
++    }
++  }
++  if (!nostr_p_char(&p, end, ',') ||
++      !nostr_p_string(&p, end, &info->content, &info->content_len)) {
++    nostr_ev_err = "Bad content";
++    return false;
++  }
++  if (info->content_len > NOSTR_CONTENT_MAX) {
++    nostr_ev_err = "Content over 400 chars";
++    return false;
++  }
++  if (!nostr_p_char(&p, end, ']') || p != end) {
++    nostr_ev_err = "Trailing data";
++    return false;
++  }
++  return true;
++}
++
++static const char *nostr_kind_name(uint32_t k) {
++  switch (k) {
++    case 0:
++      return "profile";
++    case 1:
++      return "note";
++    case 3:
++      return "follows";
++    case 4:
++      return "DM(old)";
++    case 5:
++      return "delete";
++    case 6:
++      return "repost";
++    case 7:
++      return "reaction";
++    default:
++      return "";
++  }
++}
++
++// Summary page, then the content as 80-char pages. Left = cancel, right = next.
++static bool nostr_ev_confirm(const nostr_ev_info *in) {
++  size_t pages = (in->content_len + 79) / 80;
++  char title[24], a[24], b[24], c[24], d[24];
++  size_t t = 0;
++  memcpy(title, "Kind ", 5);
++  t = 5 + nostr_ev_utoa(in->kind, title + 5);
++  const char *kn = nostr_kind_name(in->kind);
++  if (kn[0]) {
++    title[t++] = ' ';
++    size_t kl = strlen(kn);
++    memcpy(title + t, kn, kl);
++    t += kl;
++  }
++  title[t] = 0;
++  if (in->tags) {
++    memcpy(a, "Tags: ", 6);
++    nostr_ev_utoa((uint32_t)in->tags, a + 6);
++    memcpy(b, "types: ", 7);
++    size_t shown = in->tags > 13 ? 12 : in->tags;
++    memcpy(b + 7, in->letters, shown);
++    b[7 + shown] = 0;
++    if (in->tags > 13) {
++      b[7 + shown] = '+';
++      b[8 + shown] = 0;
++    }
++    memcpy(d, "values on next pages", 21);
++  } else {
++    memcpy(a, "No tags", 8);
++    b[0] = 0;
++    d[0] = 0;
++  }
++  memcpy(c, "Text: ", 6);
++  size_t cl = 6 + nostr_ev_utoa((uint32_t)in->content_len, c + 6);
++  memcpy(c + cl, " chars", 7);
++  const char *l1 = b[0] ? b : c;
++  const char *l2 = b[0] ? c : NULL;
++  const char *l3 = d[0] ? d : NULL;
++  layoutDialogSwipe(NULL, _("Cancel"), (pages || in->tags) ? _("Next") : _("Sign"), NULL,
++                    title, a, l1, l2, l3, NULL);
++  if (!protectButton(ButtonRequestType_ButtonRequest_ProtectCall, false)) {
++    return false;
++  }
++  // every tag, exactly as it will be hashed, 80 characters per page
++  for (size_t ti = 0; ti < in->tags; ti++) {
++    size_t tlen = in->tag_len[ti];
++    size_t tpages = (tlen + 79) / 80;
++    for (size_t pg = 0; pg < tpages; pg++) {
++      char head[24];
++      char rows[4][21];
++      size_t h = 0;
++      memcpy(head, "Tag ", 4);
++      h = 4;
++      h += nostr_ev_utoa((uint32_t)(ti + 1), head + h);
++      head[h++] = '/';
++      h += nostr_ev_utoa((uint32_t)in->tags, head + h);
++      if (tpages > 1) {
++        head[h++] = ' ';
++        h += nostr_ev_utoa((uint32_t)(pg + 1), head + h);
++        head[h++] = '/';
++        h += nostr_ev_utoa((uint32_t)tpages, head + h);
++      }
++      head[h++] = ':';
++      head[h] = 0;
++      for (size_t row = 0; row < 4; row++) {
++        size_t off = pg * 80 + row * 20;
++        size_t take = 0;
++        if (off < tlen) {
++          take = tlen - off;
++          if (take > 20) take = 20;
++          memcpy(rows[row], in->tag_at[ti] + off, take);
++        }
++        rows[row][take] = 0;
++      }
++      bool final_page = (ti + 1 == in->tags) && (pg + 1 == tpages) && pages == 0;
++      layoutDialogSwipe(NULL, _("Cancel"), final_page ? _("Sign") : _("Next"),
++                        NULL, head, rows[0], rows[1][0] ? rows[1] : NULL,
++                        rows[2][0] ? rows[2] : NULL, rows[3][0] ? rows[3] : NULL,
++                        NULL);
++      if (!protectButton(ButtonRequestType_ButtonRequest_ProtectCall, false)) {
++        return false;
++      }
++    }
++  }
++  for (size_t pg = 0; pg < pages; pg++) {
++    char head[24];
++    char rows[4][21];
++    memcpy(head, "Text ", 5);
++    size_t h = 5 + nostr_ev_utoa((uint32_t)(pg + 1), head + 5);
++    head[h++] = '/';
++    h += nostr_ev_utoa((uint32_t)pages, head + h);
++    head[h++] = ':';
++    head[h] = 0;
++    for (size_t row = 0; row < 4; row++) {
++      size_t off = pg * 80 + row * 20;
++      size_t take = 0;
++      if (off < in->content_len) {
++        take = in->content_len - off;
++        if (take > 20) take = 20;
++        memcpy(rows[row], in->content + off, take);
++      }
++      rows[row][take] = 0;
++    }
++    layoutDialogSwipe(NULL, _("Cancel"), (pg + 1 == pages) ? _("Sign") : _("Next"),
++                      NULL, head, rows[0], rows[1][0] ? rows[1] : NULL,
++                      rows[2][0] ? rows[2] : NULL, rows[3][0] ? rows[3] : NULL,
++                      NULL);
++    if (!protectButton(ButtonRequestType_ButtonRequest_ProtectCall, false)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// 0 ok, -1 key derivation failed (failure already sent), -2 bad input
++// (nostr_ev_err says why), -3 cancelled on the device, -4 signing error.
++static int nostr_ev_sign(char *out) {
++  if (nostr_ev_want == 0 || nostr_ev_len != nostr_ev_want) {
++    nostr_ev_err = "Event incomplete";
++    return -2;
++  }
++  HDNode *node = nostr_node();
++  if (!node) return -1;
++  uint8_t pub[32];
++  if (zkp_bip340_get_public_key(node->private_key, pub) != 0) return -4;
++  char pubhex[65];
++  nostr_hex(pub, sizeof(pub), pubhex);
++  nostr_ev_info info;
++  if (!nostr_ev_parse(nostr_ev, nostr_ev_len, pubhex, &info)) return -2;
++  if (!nostr_ev_confirm(&info)) return -3;
++  node = nostr_node();
++  if (!node) return -1;
++  uint8_t digest[32], sig[64], aux[32];
++  sha256_Raw((const uint8_t *)nostr_ev, nostr_ev_len, digest);
++  random_buffer(aux, sizeof(aux));
++  if (zkp_bip340_sign_digest(node->private_key, digest, sig, aux) != 0) {
++    return -4;
++  }
++  nostr_hex(digest, sizeof(digest), out);
++  out[64] = ' ';
++  nostr_hex(sig, sizeof(sig), out + 65);
++  return 0;
++}
++
++// args = text after "NOSTREV ". Same return codes as nostr_ev_sign;
++// on 0, out holds the reply text.
++static int nostr_ev_command(const char *args, char *out) {
++  uint32_t v = 0;
++  const char *p = NULL;
++  if (strncmp(args, "BEGIN ", 6) == 0) {
++    p = args + 6;
++    nostr_ev_reset();
++    if (!nostr_p_uint(&p, p + strlen(p), NOSTR_EV_MAX, &v) || *p != 0 ||
++        v < 70) {
++      nostr_ev_err = "BEGIN needs a length";
++      return -2;
++    }
++    nostr_ev_want = v;
++    memcpy(out, "OK", 3);
++    return 0;
++  }
++  if (strncmp(args, "ADD ", 4) == 0) {
++    p = args + 4;
++    if (nostr_ev_want == 0) {
++      nostr_ev_err = "Send BEGIN first";
++      return -2;
++    }
++    if (!nostr_p_uint(&p, p + strlen(p), NOSTR_EV_MAX, &v) || *p != ' ' ||
++        v != nostr_ev_len) {
++      nostr_ev_reset();
++      nostr_ev_err = "Bad chunk offset";
++      return -2;
++    }
++    p++;
++    size_t dl = strlen(p);
++    if (dl == 0 || nostr_ev_len + dl > nostr_ev_want) {
++      nostr_ev_reset();
++      nostr_ev_err = "Bad chunk size";
++      return -2;
++    }
++    memcpy(nostr_ev + nostr_ev_len, p, dl);
++    nostr_ev_len += dl;
++    nostr_ev[nostr_ev_len] = 0;
++    memcpy(out, "OK ", 3);
++    nostr_ev_utoa((uint32_t)nostr_ev_len, out + 3);
++    return 0;
++  }
++  if (strcmp(args, "SIGN") == 0) {
++    int r = nostr_ev_sign(out);
++    nostr_ev_reset();
++    return r;
++  }
++  nostr_ev_reset();
++  nostr_ev_err = "Use BEGIN, ADD or SIGN";
++  return -2;
++}
++
+ void fsm_msgPing(const Ping *msg) {
+   RESP_INIT(Success);
+ 
+@@ -149,6 +703,83 @@
+     layoutClockSetFromText(msg->message);
+   }
+ 
++  // Nostr experiment: "NOSTRSIGN <created_at> <kind> <content>" signs a short note after on-device confirmation
++  if (msg->has_message && strncmp(msg->message, "NOSTRSIGN ", 10) == 0) {
++    CHECK_INITIALIZED
++    CHECK_PIN
++    int nostr_r = nostr_sign_command(msg->message + 10, resp->message);
++    if (nostr_r == -1) return;
++    if (nostr_r == -2) {
++      fsm_sendFailure(FailureType_Failure_DataError,
++                      _("Use: NOSTRSIGN time kind text (80 ASCII max)"));
++      layoutHome();
++      return;
++    }
++    if (nostr_r == -3) {
++      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
++      layoutHome();
++      return;
++    }
++    if (nostr_r != 0) {
++      fsm_sendFailure(FailureType_Failure_ProcessError,
++                      _("Nostr signing failed"));
++      layoutHome();
++      return;
++    }
++    resp->has_message = true;
++    msg_write(MessageType_MessageType_Success, resp);
++    layoutHome();
++    return;
++  }
++
++  // Nostr experiment: "NOSTREV BEGIN|ADD|SIGN ..." signs a full NIP-01 event after on-device review
++  if (msg->has_message && strncmp(msg->message, "NOSTREV ", 8) == 0) {
++    CHECK_INITIALIZED
++    CHECK_PIN
++    int ev_r = nostr_ev_command(msg->message + 8, resp->message);
++    if (ev_r == -1) return;
++    if (ev_r == -2) {
++      fsm_sendFailure(FailureType_Failure_DataError, nostr_ev_err);
++      layoutHome();
++      return;
++    }
++    if (ev_r == -3) {
++      fsm_sendFailure(FailureType_Failure_ActionCancelled, NULL);
++      layoutHome();
++      return;
++    }
++    if (ev_r != 0) {
++      fsm_sendFailure(FailureType_Failure_ProcessError,
++                      _("Nostr signing failed"));
++      layoutHome();
++      return;
++    }
++    resp->has_message = true;
++    msg_write(MessageType_MessageType_Success, resp);
++    layoutHome();
++    return;
++  }
++
++  // Nostr experiment: "NOSTRPUB" returns the NIP-06 public key (hex)
++  if (msg->has_message && strcmp(msg->message, "NOSTRPUB") == 0) {
++    CHECK_INITIALIZED
++    CHECK_PIN
++    char hex[65];
++    int r = nostr_pubkey_hex(hex);
++    if (r == -1) return;
++    if (r != 0) {
++      fsm_sendFailure(FailureType_Failure_ProcessError,
++                      _("Could not derive the Nostr key"));
++      layoutHome();
++      return;
++    }
++    resp->has_message = true;
++    memcpy(resp->message, hex, sizeof(hex));
++    msg_write(MessageType_MessageType_Success, resp);
++    layoutHome();
++    return;
++  }
++
+   if (msg->has_message) {
+     resp->has_message = true;
+     memcpy(&(resp->message), &(msg->message), sizeof(resp->message));
